@@ -10,6 +10,7 @@
 #include <set>
 #include <variant>
 #include <tuple>
+#include <array> // OPTIMIZATION: Use std::array for the board
 
 // Enum for players for type safety
 enum class Player {
@@ -36,8 +37,7 @@ struct Position {
 
     // Operator for using Position in sets/maps
     bool operator<(const Position& other) const {
-        if (r != other.r) return r < other.r;
-        return c < other.c;
+        return std::tie(r, c) < std::tie(other.r, other.c);
     }
     bool operator==(const Position& other) const {
         return r == other.r && c == other.c;
@@ -62,24 +62,36 @@ struct GameMove {
 
     // The operator< function allows GameMove to be used as a map key 🔑
     bool operator<(const GameMove& other) const {
-        // std::tie creates a tuple of references and compares them lexicographically.
-        // This is the standard, safest, and most readable way to compare structs.
-        return std::tie(action, from, to, pushed_to, orientation) < 
+        return std::tie(action, from, to, pushed_to, orientation) <
                std::tie(other.action, other.from, other.to, other.pushed_to, other.orientation);
     }
-
 };
 
 // Represents the entire state of the game
 struct GameState {
-    static const int ROWS = 13;
-    static const int COLS = 12;
-    std::vector<std::vector<std::optional<Piece>>> board;
+    static constexpr int ROWS = 13; // OPTIMIZATION: Use constexpr
+    static constexpr int COLS = 12;
+
+    // OPTIMIZATION: A flat array improves cache locality and performance over a vector of vectors.
+    std::array<std::optional<Piece>, ROWS * COLS> board;
+
+    // OPTIMIZATION: Tracking piece positions avoids searching the whole board for moves.
+    std::vector<Position> circlePieces;
+    std::vector<Position> squarePieces;
+
     Player currentPlayer = Player::CIRCLE;
     bool isTerminal = false;
     std::optional<Player> winner = std::nullopt;
 
     GameState(); // Constructor to create the default starting board
+
+    // OPTIMIZATION: Helper to access the flat board using 2D coordinates.
+    const std::optional<Piece>& getPieceAt(int r, int c) const {
+        return board[r * COLS + c];
+    }
+    std::optional<Piece>& getPieceAt(int r, int c) {
+        return board[r * COLS + c];
+    }
 };
 
 // The main game environment class
@@ -117,7 +129,7 @@ public:
      * @return A vector of all possible GameMoves.
      */
     std::vector<GameMove> getValidMoves(const GameState& state) const;
-    
+
     /**
      * @brief Checks if the game is over.
      * @param state The current state.
@@ -125,30 +137,38 @@ public:
      */
     bool isGameOver(const GameState& state) const;
 
+    void displayBoard(const GameState& state) const;
+
     bool checkEq(const GameState& state1, const GameState& state2) const;
     bool checkEq(const GameMove& move1, const GameMove& move2) const;
     float getStateValue(const GameState& state) const;
-    float getQValue(const GameState& state, const GameMove& move) const;
 
     Player opponent(Player p) const;
 
 private:
     // Game constants
-    const int WIN_COUNT = 4;
+    static constexpr int WIN_COUNT = 4;
 
-    // Helper functions translated from Python logic
+    // OPTIMIZATION: Pre-calculated values to avoid re-computation in hot loops.
+    std::vector<int> m_scoreCols;
+    bool m_isOpponentScoreCellCache[2][GameState::ROWS][GameState::COLS];
+
+    // Helper functions
     int topScoreRow() const;
-    int bottomScoreRow(int rows) const;
-    std::vector<int> scoreCols(int cols) const;
+    int bottomScoreRow() const;
     bool inBounds(int r, int c) const;
     bool isOpponentScoreCell(int r, int c, Player player) const;
 
     // Core game logic helpers
     void checkWin(GameState& state) const;
-    std::set<Position> getRiverFlowDestinations(const GameState& state, Position riverPos, Position sourcePos, Player movingPlayer, bool isPush = false) const;
+    
+    // OPTIMIZATION: Added an override parameter to avoid copying the entire GameState when checking hypothetical moves (like flips/rotates).
+    std::set<Position> getRiverFlowDestinations(
+        const GameState& state, Position riverPos, Position sourcePos, Player movingPlayer, bool isPush = false,
+        const std::optional<std::pair<Position, Piece>>& overridePiece = std::nullopt
+    ) const;
+
     std::vector<GameMove> getValidMovesForPiece(const GameState& state, int r, int c) const;
 };
-
-
 
 #endif
