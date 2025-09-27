@@ -1,6 +1,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include <limits>
 #include <chrono>
 
 #include "src/customGameEngine.hpp"
@@ -15,80 +16,103 @@ int main() {
     StonesAndRiversGameEnv env;
     GameState state;
 
-    // --- Setup two MCTS Bots ---
-    std::shared_ptr<StonesAndRiversGameEnv> botEnv1 = std::make_shared<StonesAndRiversGameEnv>();
-    std::shared_ptr<StonesAndRiversGameEnv> botEnv2 = std::make_shared<StonesAndRiversGameEnv>();
+    // --- Setup MCTS Bot ---
+    // RandomModel model(100, 50); // dummy state/action sizes, adjust if needed
+    std::shared_ptr<StonesAndRiversGameEnv> botEnv = std::make_shared<StonesAndRiversGameEnv>();
+    MCTS bot(botEnv, nullptr, /*numSimulations*/ 2e3, /*explorationWeight*/ 1.0f, /*playerID*/ 2);
 
-    MCTS botCircle(botEnv1, nullptr, /*numSimulations*/ 1e3, /*explorationWeight*/ 1.0f, /*playerID*/ 1);
-    MCTS botSquare(botEnv2, nullptr, /*numSimulations*/ 1e3, /*explorationWeight*/ 1.0f, /*playerID*/ 2);
-
-    int moveCountCircle = 0;
-    int moveCountSquare = 0;
-
-    while (!env.isGameOver(state) && moveCountCircle < 500 && moveCountSquare < 500) {
+    while (!env.isGameOver(state)) {
         clearScreen();
         printBoard(state, env);
 
         std::string currentPlayerStr = (state.currentPlayer == Player::CIRCLE) ? "Circle (🔴)" : "Square (🔵)";
         std::cout << "\n--- Player " << currentPlayerStr << "'s Turn ---" << std::endl;
 
-        // --- Select current bot ---
-        MCTS& currentBot = (state.currentPlayer == Player::CIRCLE) ? botCircle : botSquare;
-
-        std::cout << "🤖 Bot is thinking..." << std::endl;
-        auto start = std::chrono::high_resolution_clock::now();
-
-        // Always give bot the state from its own perspective
-        GameState botPerspective = env.flipBoard(state);
-
-        // Run MCTS
-        auto moveProbs = currentBot.search(botPerspective);
-        if (moveProbs.empty()) {
-            std::cout << "Bot has no valid moves! Game ends." << std::endl;
-            break;
-        }
-
-        // Pick best move
-        auto bestMove = moveProbs[0].first;
-
-        // Apply move in bot’s flipped world
-        GameState testState = env.step(botPerspective, bestMove);
-        GameState unflippedState = env.flipBoard(testState);
-
-        // Translate back to actual game state
-        auto validMoves = env.getValidMoves(state);
-        GameMove chosenMove;
-        bool found = false;
-        for (auto& m : validMoves) {
-            GameState next = env.step(state, m);
-            if (env.checkEq(next, unflippedState)) {
-                chosenMove = m;
-                found = true;
+        if (state.currentPlayer == Player::CIRCLE) {
+            // --- Human Move ---
+            auto validMoves = env.getValidMoves(state);
+            if (validMoves.empty()) {
+                std::cout << "No valid moves available! Game ends." << std::endl;
                 break;
             }
+
+            std::cout << "Available Moves:" << std::endl;
+            for (size_t i = 0; i < validMoves.size(); ++i) {
+                std::cout << "  " << i + 1 << ". " << moveToString(validMoves[i]) << std::endl;
+            }
+
+            int moveChoice = 0;
+            while (true) {
+                std::cout << "\nEnter the number of your move (1-" << validMoves.size() << "): ";
+                std::cin >> moveChoice;
+
+                if (std::cin.good() && moveChoice >= 1 && moveChoice <= static_cast<int>(validMoves.size())) {
+                    break;
+                } else {
+                    std::cout << "Invalid input. Try again." << std::endl;
+                    std::cin.clear();
+                    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+                }
+            }
+
+            const GameMove& chosenMove = validMoves[moveChoice - 1];
+            state = env.step(state, chosenMove);
+        } else {
+            // --- MCTS Bot Move ---
+            std::cout << "🤖 Bot is thinking..." << std::endl;
+            auto start = std::chrono::high_resolution_clock::now();
+
+            // Flip state for bot perspective
+            GameState flipped = env.flipBoard(state);
+
+            // Run MCTS
+            auto moveProbs = bot.search(flipped);
+
+            if (moveProbs.empty()) {
+                std::cout << "Bot has no valid moves! Game ends." << std::endl;
+                break;
+            }
+
+            // Pick best move (highest probability)
+            auto bestMove = moveProbs[0].first;
+
+            // Flip move back to human perspective
+            // (MCTS works on flipped board, so we need to unflip)
+            GameState testState = env.step(flipped, bestMove);
+            GameState unflippedState = env.flipBoard(testState);
+
+            // Find equivalent move in current state's valid moves
+            auto validMoves = env.getValidMoves(state);
+            GameMove chosenMove;
+            bool found = false;
+            for (auto& m : validMoves) {
+                GameState next = env.step(state, m);
+                if (env.checkEq(next, unflippedState)) {
+                    chosenMove = m;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                std::cerr << "Bot move translation failed!" << std::endl;
+                break;
+            }
+
+            std::cout << "🤖 Bot plays: " << moveToString(chosenMove) << std::endl;
+            state = env.step(state, chosenMove);
+
+            auto end = std::chrono::high_resolution_clock::now();
+            std::chrono::duration<double> duration = end - start;
+
+            // Register move with MCTS root
+            bot.registerMove(chosenMove);
+
+            // Pause so human can see bot move
+            std::cout << "Bot took " << duration.count() << " seconds to make a move.\n";
+            std::cout << "Press Enter to continue...";
+            std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+            std::cin.get();
         }
-        if (!found) {
-            std::cerr << "Bot move translation failed!" << std::endl;
-            break;
-        }
-
-        // Execute move
-        state = env.step(state, chosenMove);
-
-        auto end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double> duration = end - start;
-
-        std::cout << "🤖 Bot plays: " << moveToString(chosenMove) << std::endl;
-        std::cout << "Bot took " << duration.count() << " seconds.\n";
-
-        // Register move with MCTS root
-        currentBot.registerMove(chosenMove);
-
-        // Update move counters
-        if (state.currentPlayer == Player::CIRCLE)
-            moveCountSquare++; // Square just moved
-        else
-            moveCountCircle++; // Circle just moved
     }
 
     // --- Game Over ---
@@ -106,6 +130,7 @@ int main() {
 }
 
 // --- Helper Functions ---
+
 std::string moveToString(const GameMove& move) {
     std::string s = "";
     switch (move.action) {

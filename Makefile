@@ -26,4 +26,4 @@ run: $(TARGET)
 
 # Clean build files
 clean:
-	rm -f $(OBJ) $(TARGET)
+	rm -f $(OBJ) $(TARGET) massif.*

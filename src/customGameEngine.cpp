@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <vector>
 #include <iomanip>
+#include <cmath>   // For std::tanh
+#include <numeric> // For std::accumulate
 
 // --- GameState Implementation ---
 GameState::GameState() {
@@ -10,14 +12,12 @@ GameState::GameState() {
     int width = std::min(6, std::max(2, COLS - 6));
     int start_col = (COLS - width) / 2;
 
-    // Player::SQUARE pieces (top)
     for (int r : {3, 4}) {
         for (int c = start_col; c < start_col + width; ++c) {
             getPieceAt(r, c) = Piece{Player::SQUARE, Side::STONE, Orientation::NONE};
             squarePieces.push_back({r, c});
         }
     }
-    // Player::CIRCLE pieces (bottom)
     for (int r : {ROWS - 5, ROWS - 4}) {
         for (int c = start_col; c < start_col + width; ++c) {
             getPieceAt(r, c) = Piece{Player::CIRCLE, Side::STONE, Orientation::NONE};
@@ -28,19 +28,19 @@ GameState::GameState() {
 
 // --- StonesAndRiversGameEnv Implementation ---
 StonesAndRiversGameEnv::StonesAndRiversGameEnv() {
-    // OPTIMIZATION: Pre-calculate score columns and opponent score cells once at initialization.
     int w = 4;
     int start = std::max(0, (GameState::COLS - w) / 2);
     for (int i = start; i < start + w; ++i) {
         m_scoreCols.push_back(i);
+        // NEW: Cache the scoring positions
+        m_circleScorePositions.push_back({topScoreRow(), i});
+        m_squareScorePositions.push_back({bottomScoreRow(), i});
     }
 
     for (int r = 0; r < GameState::ROWS; ++r) {
         for (int c = 0; c < GameState::COLS; ++c) {
             bool is_in_score_cols = (std::find(m_scoreCols.begin(), m_scoreCols.end(), c) != m_scoreCols.end());
-            // Cache for Player::CIRCLE's opponent (SQUARE)
             m_isOpponentScoreCellCache[0][r][c] = (r == bottomScoreRow() && is_in_score_cols);
-            // Cache for Player::SQUARE's opponent (CIRCLE)
             m_isOpponentScoreCellCache[1][r][c] = (r == topScoreRow() && is_in_score_cols);
         }
     }
@@ -62,7 +62,6 @@ bool StonesAndRiversGameEnv::inBounds(int r, int c) const {
 }
 
 bool StonesAndRiversGameEnv::isOpponentScoreCell(int r, int c, Player player) const {
-    // OPTIMIZATION: O(1) lookup from the pre-calculated cache.
     return m_isOpponentScoreCellCache[static_cast<int>(player)][r][c];
 }
 
@@ -70,18 +69,13 @@ void StonesAndRiversGameEnv::checkWin(GameState& state) const {
     int circle_count = 0;
     int square_count = 0;
 
-    // Circle scores at the top
     for (int c : m_scoreCols) {
-        const auto& piece = state.getPieceAt(topScoreRow(), c);
-        if (piece && piece->owner == Player::CIRCLE && piece->side == Side::STONE) {
+        const auto& piece_top = state.getPieceAt(topScoreRow(), c);
+        if (piece_top && piece_top->owner == Player::CIRCLE && piece_top->side == Side::STONE) {
             circle_count++;
         }
-    }
-
-    // Square scores at the bottom
-    for (int c : m_scoreCols) {
-        const auto& piece = state.getPieceAt(bottomScoreRow(), c);
-        if (piece && piece->owner == Player::SQUARE && piece->side == Side::STONE) {
+        const auto& piece_bottom = state.getPieceAt(bottomScoreRow(), c);
+        if (piece_bottom && piece_bottom->owner == Player::SQUARE && piece_bottom->side == Side::STONE) {
             square_count++;
         }
     }
@@ -89,9 +83,18 @@ void StonesAndRiversGameEnv::checkWin(GameState& state) const {
     if (circle_count >= WIN_COUNT) {
         state.isTerminal = true;
         state.winner = Player::CIRCLE;
-    } else if (square_count >= WIN_COUNT) {
+        return; // Win takes precedence over draw
+    }
+    if (square_count >= WIN_COUNT) {
         state.isTerminal = true;
         state.winner = Player::SQUARE;
+        return; // Win takes precedence over draw
+    }
+    
+    // NEW: Check for draw by move count
+    if (state.numMoves >= GameState::MAX_MOVES) {
+        state.isTerminal = true;
+        state.winner = std::nullopt; // No winner means a draw
     }
 }
 
@@ -295,6 +298,7 @@ GameState StonesAndRiversGameEnv::step(const GameState& state, const GameMove& m
     if (state.isTerminal) return state;
 
     GameState next_state = state;
+    next_state.memoizedValue = std::nullopt;
     auto& board = next_state.board;
     auto piece = board[move.from.r * GameState::COLS + move.from.c];
 
@@ -349,6 +353,9 @@ GameState StonesAndRiversGameEnv::step(const GameState& state, const GameMove& m
             break;
     }
 
+    // INCREMENT MOVE COUNT
+    next_state.numMoves++;
+
     checkWin(next_state);
 
     if (!next_state.isTerminal) {
@@ -382,6 +389,9 @@ GameState StonesAndRiversGameEnv::flipBoard(const GameState& state) const {
         }
     }
 
+    // Copy the move count
+    flipped_state.numMoves = state.numMoves;
+
     flipped_state.currentPlayer = opponent(state.currentPlayer);
     flipped_state.isTerminal = state.isTerminal;
     if (state.winner.has_value()) {
@@ -391,9 +401,144 @@ GameState StonesAndRiversGameEnv::flipBoard(const GameState& state) const {
     return flipped_state;
 }
 
-float StonesAndRiversGameEnv::getStateValue(const GameState& state) const {
-    return 0; // Placeholder
+/**
+ * @brief Heuristic 2: Calculates the sum of shortest paths for the 4 closest stones to reach any 4 scoring positions.
+ * This is a fast approximation using BFS. A lower number is better.
+ */
+int StonesAndRiversGameEnv::calculateMinStepsToScore(const GameState& state, Player player) const {
+    const auto& pieces = (player == Player::CIRCLE) ? state.circlePieces : state.squarePieces;
+    const auto& score_positions = (player == Player::CIRCLE) ? m_circleScorePositions : m_squareScorePositions;
+
+    std::vector<int> all_min_distances;
+    all_min_distances.reserve(pieces.size());
+
+    for (const auto& piece_pos : pieces) {
+        if(state.getPieceAt(piece_pos.r, piece_pos.c)->side != Side::STONE) continue;
+
+        // BFS to find shortest path from this piece to any score cell
+        std::queue<std::pair<Position, int>> q;
+        q.push({piece_pos, 0});
+        std::array<bool, GameState::ROWS * GameState::COLS> visited{};
+        visited[piece_pos.r * GameState::COLS + piece_pos.c] = true;
+        
+        int min_dist = 999; // Sentinel value
+
+        while(!q.empty()){
+            auto [curr_pos, dist] = q.front();
+            q.pop();
+
+            // Check if this is a score position
+            for(const auto& score_pos : score_positions){
+                if(curr_pos.r == score_pos.r && curr_pos.c == score_pos.c){
+                    min_dist = dist;
+                    goto found_path; // Exit both loops
+                }
+            }
+
+            if (dist > 20) continue; // Optimization: don't search too far
+
+            // Explore neighbors
+            int dr[] = {-1, 1, 0, 0};
+            int dc[] = {0, 0, -1, 1};
+            for(int i = 0; i < 4; ++i){
+                int nr = curr_pos.r + dr[i];
+                int nc = curr_pos.c + dc[i];
+
+                if(inBounds(nr, nc) && !visited[nr * GameState::COLS + nc]){
+                    // Can only move through empty cells for this heuristic
+                    if(!state.getPieceAt(nr, nc) || (nr == score_positions[0].r && std::find(m_scoreCols.begin(), m_scoreCols.end(), nc) != m_scoreCols.end())){
+                        visited[nr * GameState::COLS + nc] = true;
+                        q.push({{nr, nc}, dist + 1});
+                    }
+                }
+            }
+        }
+        found_path:;
+        if(min_dist != 999) {
+            all_min_distances.push_back(min_dist);
+        }
+    }
+
+    if (all_min_distances.empty()) return 999 * 4;
+
+    std::sort(all_min_distances.begin(), all_min_distances.end());
+    int total_dist = 0;
+    int count = 0;
+    for(int dist : all_min_distances) {
+        if(count >= 4) break;
+        total_dist += dist;
+        count++;
+    }
+    return total_dist;
 }
+
+float StonesAndRiversGameEnv::getStateValue(const GameState& state) const {
+    if (state.memoizedValue.has_value()) {
+        return *state.memoizedValue;
+    }
+    
+    // --- 1. Handle Terminal States ---
+    if (state.isTerminal) {
+        if (state.winner.has_value()) {
+            return (*state.winner == state.currentPlayer) ? WIN_REWARD : -WIN_REWARD;
+        }
+        return 0.0f; // Draw
+    }
+
+    // --- 2. Calculate Heuristics for a Non-Terminal State ---
+    auto calculate_score_for_player = [&](Player player) {
+        float score = 0.0f;
+        
+        const float W_MOBILITY = 0.2f;
+        const float W_DISTANCE = 0.5f;
+        const float W_SCORE_POS = 15.0f;
+
+        // Heuristic 1: Mobility (number of travellable locations)
+        std::set<Position> unique_dests;
+        const auto& pieces = (player == Player::CIRCLE) ? state.circlePieces : state.squarePieces;
+        for (const auto& pos : pieces) {
+            auto moves = getValidMovesForPiece(state, pos.r, pos.c);
+            for(const auto& move : moves){
+                if(move.to.has_value()) unique_dests.insert(*move.to);
+            }
+        }
+        score += unique_dests.size() * W_MOBILITY;
+
+        // Heuristic 2: Distance to scoring zone (lower is better)
+        int distance = calculateMinStepsToScore(state, player);
+        score -= distance * W_DISTANCE;
+
+        // Heuristic 3: Number of stones already in scoring locations
+        int stones_in_score = 0;
+        const auto& score_positions = (player == Player::CIRCLE) ? m_circleScorePositions : m_squareScorePositions;
+        for(const auto& pos : score_positions){
+            const auto& piece = state.getPieceAt(pos.r, pos.c);
+            if(piece && piece->owner == player && piece->side == Side::STONE){
+                stones_in_score++;
+            }
+        }
+        score += stones_in_score * W_SCORE_POS;
+        
+        return score;
+    };
+
+    float current_player_score = calculate_score_for_player(state.currentPlayer);
+    float opponent_player_score = calculate_score_for_player(opponent(state.currentPlayer));
+
+    // std::cout << "Score for player: " << current_player_score << std::endl;
+    // std::cout << "Score for opp: " << opponent_player_score << std::endl;
+
+    float raw_value = current_player_score - opponent_player_score;
+    
+    // --- 3. Normalize and Return ---
+    // Use tanh to smoothly scale the value into the [-WIN_REWARD, WIN_REWARD] range.
+    // This prevents extreme values from single heuristics and provides a stable gradient.
+    const float scaling_factor = 50.0f;
+    float final_value = std::tanh(raw_value / scaling_factor) * WIN_REWARD;
+    state.memoizedValue = final_value;
+    return final_value;
+}
+
 
 bool StonesAndRiversGameEnv::checkEq(const GameState& state1, const GameState& state2) const {
     if (state1.currentPlayer != state2.currentPlayer ||

@@ -21,7 +21,8 @@ public:
         int player = 1,
         MCTSNode* parent = nullptr,
         float probPrior = 1.0f,
-        float explorationWeight = 1.0f
+        float explorationWeight = 1.0f,
+        int height = 0
     );
 
     ~MCTSNode();
@@ -30,7 +31,7 @@ public:
     float getUCB(const MCTSNode* child) const;
     MCTSNode* bestChild() const;
     void expand();
-    void backpropagate(float value);
+    void backpropagate(float value, int h = 0);
 
     std::shared_ptr<StonesAndRiversGameEnv> game;
     GameState state;
@@ -41,6 +42,7 @@ public:
     float explorationWeight;
     float valueSum;
     int visits;
+    int height;
     
     std::vector<std::unique_ptr<MCTSNode>> children;
 };
